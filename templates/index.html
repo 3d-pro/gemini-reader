@@ -1,0 +1,688 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gemini AI Studio Reader</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div id="chat-container">
+        <div id="token-counter">
+            <span>Tokens: <span id="token-count">0</span> / 1,000,000</span>
+            <button type="button" id="reset-tokens" title="Reset Token Count">🔄</button>
+        </div>
+        <div id="chat-history"></div>
+    </div>
+    <form id="prompt-form">
+        <button type="button" id="dark-mode-toggle" title="Toggle Dark Mode">🌙</button>
+        <button type="button" id="cache-btn" title="Manage Context Cache">📦</button>
+        <button type="button" id="system-btn" title="Set System Instructions">⚙️</button>
+        <textarea id="prompt-input" placeholder="Enter your prompt..." rows="1"></textarea>
+        <button type="submit">Send</button>
+    </form>
+
+    <!-- Cache Management Modal -->
+    <div id="cache-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Context Cache Management</h3>
+                <span class="close cache-close">&times;</span>
+            </div>
+            <div class="modal-body">
+                <div id="cache-status" class="cache-status">
+                    <p><strong>Cache Status:</strong> <span id="cache-status-text">Not cached</span></p>
+                    <p><strong>Cache Name:</strong> <span id="cache-name-text">None</span></p>
+                </div>
+                <div class="cache-actions">
+                    <button type="button" id="send-cache-btn" class="cache-action-btn">Send to Cache</button>
+                    <button type="button" id="update-cache-btn" class="cache-action-btn">Update Cache</button>
+                    <button type="button" id="clear-cache-btn" class="cache-action-btn danger">Clear Cache</button>
+                </div>
+                <div id="cache-feedback" class="cache-feedback"></div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" id="close-cache">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- System Instruction Modal -->
+    <div id="system-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>System Instructions</h3>
+                <span class="close">&times;</span>
+            </div>
+            <div class="modal-body">
+                <textarea id="system-instruction" placeholder="Enter system instructions for the AI model..." rows="8"></textarea>
+            </div>
+            <div class="modal-footer">
+                <button type="button" id="save-system">Save</button>
+                <button type="button" id="cancel-system">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            const chatHistory = document.getElementById('chat-history');
+            const chatContainer = document.getElementById('chat-container');
+            const promptForm = document.getElementById('prompt-form');
+            const promptInput = document.getElementById('prompt-input');
+            const darkModeToggle = document.getElementById('dark-mode-toggle');
+            const resetTokensBtn = document.getElementById('reset-tokens');
+            const systemBtn = document.getElementById('system-btn');
+            const systemModal = document.getElementById('system-modal');
+            const systemInstruction = document.getElementById('system-instruction');
+            const saveSystemBtn = document.getElementById('save-system');
+            const cancelSystemBtn = document.getElementById('cancel-system');
+            const closeBtn = document.querySelector('.close');
+
+            // Cache management elements
+            const cacheBtn = document.getElementById('cache-btn');
+            const cacheModal = document.getElementById('cache-modal');
+            const cacheCloseBtn = document.querySelector('.cache-close');
+            const closeCacheBtn = document.getElementById('close-cache');
+            const sendCacheBtn = document.getElementById('send-cache-btn');
+            const updateCacheBtn = document.getElementById('update-cache-btn');
+            const clearCacheBtn = document.getElementById('clear-cache-btn');
+            const cacheStatusText = document.getElementById('cache-status-text');
+            const cacheNameText = document.getElementById('cache-name-text');
+            const cacheFeedback = document.getElementById('cache-feedback');
+
+            let currentSystemInstruction = '';
+            let currentCacheName = localStorage.getItem('cacheName') || '';
+            let isDarkMode = localStorage.getItem('darkMode') === 'true';
+            let userIsScrollingUp = false;
+            let scrollTimeout = null;
+            let totalTokens = parseInt(localStorage.getItem('totalTokens') || '0');
+            let currentAbortController = null; // Track current request for cleanup
+            let currentReader = null;
+
+            // Token counter functions
+            function updateTokenDisplay() {
+                const tokenCountElement = document.getElementById('token-count');
+                tokenCountElement.textContent = totalTokens.toLocaleString();
+                
+                // Color coding based on usage
+                if (totalTokens > 800000) {
+                    tokenCountElement.style.color = '#ff4444'; // Red
+                } else if (totalTokens > 600000) {
+                    tokenCountElement.style.color = '#ff8800'; // Orange
+                } else {
+                    tokenCountElement.style.color = isDarkMode ? '#a0a0a0' : '#666';
+                }
+            }
+
+            function estimateTokens(text) {
+                // Rough estimate: 1 token ≈ 4 characters for English text
+                // This is used as fallback when API counting is not available
+                return Math.ceil(text.length / 4);
+            }
+
+            function countTokensAPI(text, includeHistory = false) {
+                // Use Gemini API to count tokens accurately
+                return fetch('/count_tokens', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        text: text,
+                        include_history: includeHistory
+                    })
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        return data.total_tokens;
+                    } else {
+                        console.warn('API token counting failed, using estimation:', data.error);
+                        return estimateTokens(text);
+                    }
+                })
+                .catch(error => {
+                    console.warn('API token counting failed, using estimation:', error);
+                    return estimateTokens(text);
+                });
+            }
+
+            function addTokens(count) {
+                if (typeof count === 'number') {
+                    totalTokens += count;
+                    localStorage.setItem('totalTokens', totalTokens.toString());
+                    updateTokenDisplay();
+                }
+            }
+
+            function setTotalTokens(count) {
+                if (typeof count === 'number') {
+                    totalTokens = count;
+                    localStorage.setItem('totalTokens', totalTokens.toString());
+                    updateTokenDisplay();
+                }
+            }
+
+            function resetTokenCount() {
+                if (confirm('Reset token count to 0?')) {
+                    totalTokens = 0;
+                    localStorage.setItem('totalTokens', '0');
+                    updateTokenDisplay();
+                }
+            }
+
+            // Update total token count from chat history
+            function updateTokenCountFromHistory() {
+                countTokensAPI('', true)
+                    .then(totalCount => {
+                        setTotalTokens(totalCount);
+                        console.log(`Updated total token count from history: ${totalCount}`);
+                    })
+                    .catch(error => {
+                        console.warn('Failed to update token count from history:', error);
+                    });
+            }
+
+            // Initialize dark mode
+            function initDarkMode() {
+                if (isDarkMode) {
+                    document.body.classList.add('dark-mode');
+                    darkModeToggle.textContent = '☀️';
+                } else {
+                    document.body.classList.remove('dark-mode');
+                    darkModeToggle.textContent = '🌙';
+                }
+            }
+
+            // Toggle dark mode
+            function toggleDarkMode() {
+                isDarkMode = !isDarkMode;
+                localStorage.setItem('darkMode', isDarkMode);
+                initDarkMode();
+            }
+
+            // Auto-resize textarea
+            function autoResizeTextarea() {
+                promptInput.style.height = 'auto';
+                promptInput.style.height = Math.min(promptInput.scrollHeight, 120) + 'px';
+            }
+
+            // Check if user is near bottom of chat
+            function isUserNearBottom() {
+                const threshold = 100; // pixels from bottom
+                return chatContainer.scrollTop + chatContainer.clientHeight >= chatContainer.scrollHeight - threshold;
+            }
+
+            // Smart scroll - only scroll if user is near bottom
+            function smartScroll() {
+                if (isUserNearBottom() && !userIsScrollingUp) {
+                    setTimeout(() => {
+                        chatContainer.scrollTop = chatContainer.scrollHeight;
+                    }, 10);
+                }
+            }
+
+            // Detect user scrolling up
+            let lastScrollTop = 0;
+            function handleScroll() {
+                const currentScrollTop = chatContainer.scrollTop;
+                
+                if (currentScrollTop < lastScrollTop && currentScrollTop < chatContainer.scrollHeight - chatContainer.clientHeight - 50) {
+                    // User is scrolling up and not near bottom
+                    userIsScrollingUp = true;
+                } else if (isUserNearBottom()) {
+                    // User scrolled back to bottom
+                    userIsScrollingUp = false;
+                }
+                
+                lastScrollTop = currentScrollTop;
+                
+                // Clear timeout and set new one
+                clearTimeout(scrollTimeout);
+                scrollTimeout = setTimeout(() => {
+                    if (isUserNearBottom()) {
+                        userIsScrollingUp = false;
+                    }
+                }, 1000);
+            }
+
+            // Load saved system instruction from localStorage
+            const savedSystemInstruction = localStorage.getItem('systemInstruction');
+            if (savedSystemInstruction) {
+                currentSystemInstruction = savedSystemInstruction;
+                systemInstruction.value = savedSystemInstruction;
+            }
+
+            // Update cache status display
+            function updateCacheStatus() {
+                if (currentCacheName) {
+                    cacheStatusText.textContent = 'Cached';
+                    cacheNameText.textContent = currentCacheName;
+                } else {
+                    cacheStatusText.textContent = 'Not cached';
+                    cacheNameText.textContent = 'None';
+                }
+            }
+
+            // Show feedback message
+            function showCacheFeedback(message, type = 'info') {
+                cacheFeedback.innerHTML = `<div class="feedback-message ${type}">${message}</div>`;
+                setTimeout(() => {
+                    cacheFeedback.innerHTML = '';
+                }, 5000);
+            }
+
+            // Cache management functions
+            function sendToCache() {
+                sendCacheBtn.disabled = true;
+                showCacheFeedback('Sending context to cache...', 'info');
+                
+                fetch('/cache/send', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ systemInstruction: currentSystemInstruction })
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        currentCacheName = data.cacheName;
+                        localStorage.setItem('cacheName', currentCacheName);
+                        updateCacheStatus();
+                        showCacheFeedback('Context successfully cached!', 'success');
+                    } else {
+                        showCacheFeedback(`Error: ${data.error}`, 'error');
+                    }
+                })
+                .catch(error => {
+                    showCacheFeedback(`Error: ${error.message}`, 'error');
+                })
+                .finally(() => {
+                    sendCacheBtn.disabled = false;
+                });
+            }
+
+            function updateCache() {
+                if (!currentCacheName) {
+                    showCacheFeedback('No cache to update. Send to cache first.', 'warning');
+                    return;
+                }
+                
+                updateCacheBtn.disabled = true;
+                showCacheFeedback('Updating cache...', 'info');
+                
+                fetch('/cache/update', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ 
+                        cacheName: currentCacheName,
+                        systemInstruction: currentSystemInstruction
+                    })
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        showCacheFeedback('Cache successfully updated!', 'success');
+                    } else {
+                        showCacheFeedback(`Error: ${data.error}`, 'error');
+                    }
+                })
+                .catch(error => {
+                    showCacheFeedback(`Error: ${error.message}`, 'error');
+                })
+                .finally(() => {
+                    updateCacheBtn.disabled = false;
+                });
+            }
+
+            function clearCache() {
+                if (!currentCacheName) {
+                    showCacheFeedback('No cache to clear.', 'warning');
+                    return;
+                }
+                
+                if (!confirm('Are you sure you want to clear the cache?')) {
+                    return;
+                }
+                
+                clearCacheBtn.disabled = true;
+                showCacheFeedback('Clearing cache...', 'info');
+                
+                fetch(`/cache/clear/${currentCacheName}`, { method: 'DELETE' })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        currentCacheName = '';
+                        localStorage.removeItem('cacheName');
+                        updateCacheStatus();
+                        showCacheFeedback('Cache cleared successfully!', 'success');
+                    } else {
+                        showCacheFeedback(`Error: ${data.error}`, 'error');
+                    }
+                })
+                .catch(error => {
+                    showCacheFeedback(`Error: ${error.message}`, 'error');
+                })
+                .finally(() => {
+                    clearCacheBtn.disabled = false;
+                });
+            }
+
+            // Event listeners for cache management
+            cacheBtn.addEventListener('click', function() {
+                updateCacheStatus();
+                cacheModal.style.display = 'block';
+            });
+
+            cacheCloseBtn.addEventListener('click', function() {
+                cacheModal.style.display = 'none';
+            });
+
+            closeCacheBtn.addEventListener('click', function() {
+                cacheModal.style.display = 'none';
+            });
+
+            sendCacheBtn.addEventListener('click', sendToCache);
+            updateCacheBtn.addEventListener('click', updateCache);
+            clearCacheBtn.addEventListener('click', clearCache);
+
+            // Dark mode toggle
+            darkModeToggle.addEventListener('click', toggleDarkMode);
+
+            // Reset tokens button
+            resetTokensBtn.addEventListener('click', resetTokenCount);
+
+            // Textarea auto-resize
+            promptInput.addEventListener('input', autoResizeTextarea);
+            promptInput.addEventListener('keydown', function(e) {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    promptForm.dispatchEvent(new Event('submit'));
+                }
+            });
+
+            // Scroll detection
+            chatContainer.addEventListener('scroll', handleScroll);
+
+            // System instruction modal handling
+            systemBtn.addEventListener('click', function() {
+                systemModal.style.display = 'block';
+            });
+
+            closeBtn.addEventListener('click', function() {
+                systemModal.style.display = 'none';
+            });
+
+            cancelSystemBtn.addEventListener('click', function() {
+                systemModal.style.display = 'none';
+                systemInstruction.value = currentSystemInstruction;
+            });
+
+            saveSystemBtn.addEventListener('click', function() {
+                currentSystemInstruction = systemInstruction.value;
+                localStorage.setItem('systemInstruction', currentSystemInstruction);
+                systemModal.style.display = 'none';
+            });
+
+            // Close modals when clicking outside
+            window.addEventListener('click', function(event) {
+                if (event.target === systemModal) {
+                    systemModal.style.display = 'none';
+                    systemInstruction.value = currentSystemInstruction;
+                }
+                if (event.target === cacheModal) {
+                    cacheModal.style.display = 'none';
+                }
+            });
+
+            // Function to format text (now mostly handles basic HTML escaping since backend does markdown)
+            function formatText(text) {
+                // Basic HTML escaping for safety
+                return text
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;')
+                    .replace(/"/g, '&quot;')
+                    .replace(/'/g, '&#39;');
+            }
+
+            // Simple formatting for real-time streaming
+            function formatTextSimple(text) {
+                return text
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;')
+                    .replace(/\n/g, '<br>');
+            }
+
+            // Function to load and display chat history
+            function loadHistory() {
+                fetch('/get_history')
+                    .then(response => response.json())
+                    .then(data => {
+                        chatHistory.innerHTML = '';
+                        data.forEach(turn => {
+                            const turnDiv = document.createElement('div');
+                            turnDiv.classList.add(turn.role === 'user' ? 'user-turn' : 'model-turn');
+                            
+                            const roleLabel = document.createElement('div');
+                            roleLabel.classList.add('role-label');
+                            roleLabel.textContent = turn.role === 'user' ? 'You' : 'AI';
+                            turnDiv.appendChild(roleLabel);
+                            
+                            turn.parts.forEach(part => {
+                                const partDiv = document.createElement('div');
+                                partDiv.classList.add('message-content');
+                                // Use the formatted HTML from the backend
+                                partDiv.innerHTML = part.html || formatText(part.text);
+                                turnDiv.appendChild(partDiv);
+                            });
+                            chatHistory.appendChild(turnDiv);
+                        });
+                        smartScroll();
+                    });
+            }
+
+            // Function to handle prompt submission
+            promptForm.addEventListener('submit', function(e) {
+                e.preventDefault();
+                const prompt = promptInput.value;
+                if (!prompt) return;
+
+                // Abort any ongoing request before starting a new one
+                if (currentAbortController) {
+                    console.log('Aborting previous request...');
+                    currentAbortController.abort();
+                    
+                    // Clean up reader if exists
+                    if (currentReader) {
+                        try {
+                            currentReader.cancel();
+                        } catch (e) {
+                            console.log('Reader cleanup completed');
+                        }
+                        currentReader = null;
+                    }
+                    currentAbortController = null;
+                }
+
+                // Create new abort controller for this request
+                currentAbortController = new AbortController();
+
+                // Disable form to prevent multiple submissions
+                promptInput.disabled = true;
+                const submitBtn = promptForm.querySelector('button[type="submit"]');
+                if (submitBtn) submitBtn.disabled = true;
+
+                // Add user prompt to chat history immediately
+                const userTurnDiv = document.createElement('div');
+                userTurnDiv.classList.add('user-turn');
+                
+                const userRoleLabel = document.createElement('div');
+                userRoleLabel.classList.add('role-label');
+                userRoleLabel.textContent = 'You';
+                userTurnDiv.appendChild(userRoleLabel);
+                
+                const userContentDiv = document.createElement('div');
+                userContentDiv.classList.add('message-content');
+                // For user input, we can apply basic formatting
+                userContentDiv.innerHTML = formatText(prompt).replace(/\n/g, '<br>');
+                userTurnDiv.appendChild(userContentDiv);
+                
+                chatHistory.appendChild(userTurnDiv);
+                smartScroll();
+
+                // Create AI response bubble immediately for streaming
+                const aiTurnDiv = document.createElement('div');
+                aiTurnDiv.classList.add('model-turn');
+                
+                const aiRoleLabel = document.createElement('div');
+                aiRoleLabel.classList.add('role-label');
+                aiRoleLabel.textContent = 'AI';
+                aiTurnDiv.appendChild(aiRoleLabel);
+                
+                const aiContentDiv = document.createElement('div');
+                aiContentDiv.classList.add('message-content');
+                aiContentDiv.innerHTML = '<p class="typing-indicator">Thinking...</p>';
+                aiTurnDiv.appendChild(aiContentDiv);
+                
+                chatHistory.appendChild(aiTurnDiv);
+                smartScroll();
+
+                promptInput.value = '';
+                autoResizeTextarea(); // Reset textarea height
+                let streamingContent = '';
+                let promptTokenCount = 0;
+
+                // Count tokens for the user prompt using API
+                countTokensAPI(prompt)
+                    .then(tokens => {
+                        promptTokenCount = tokens;
+                        console.log(`User prompt tokens: ${tokens}`);
+                    })
+                    .catch(error => {
+                        console.warn('Failed to count prompt tokens:', error);
+                        promptTokenCount = estimateTokens(prompt);
+                    });
+
+                // Send request with system instruction and cache name
+                fetch('/send_prompt', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        prompt: prompt,
+                        systemInstruction: currentSystemInstruction,
+                        cacheName: currentCacheName
+                    }),
+                    signal: currentAbortController.signal
+                })
+                .then(response => {
+                    if (!response.ok) throw new Error('Network response was not ok');
+                    
+                    const reader = response.body.getReader();
+                    currentReader = reader;
+                    const decoder = new TextDecoder();
+
+                    function readStream() {
+                        return reader.read().then(({ done, value }) => {
+                            if (done) {
+                                // Clean up
+                                currentReader = null;
+                                currentAbortController = null;
+                                
+                                // Re-enable the form
+                                promptInput.disabled = false;
+                                const submitBtn = promptForm.querySelector('button[type="submit"]');
+                                if (submitBtn) submitBtn.disabled = false;
+                                
+                                // Stream is complete, reload history to get the final saved version
+                                setTimeout(() => {
+                                    loadHistory();
+                                }, 500);
+                                // Update token count from full conversation history
+                                setTimeout(() => {
+                                    updateTokenCountFromHistory();
+                                }, 1000);
+                                return;
+                            }
+
+                            try {
+                                const chunk = decoder.decode(value);
+                                const lines = chunk.split('\n');
+                                
+                                lines.forEach(line => {
+                                    if (line.startsWith('data: ')) {
+                                        try {
+                                            const data = JSON.parse(line.substring(6));
+                                            if (data.error) {
+                                                aiContentDiv.innerHTML = `<p class="error">${data.error}</p>`;
+                                            } else if (data.type === 'token_usage') {
+                                                // Handle token usage metadata from API
+                                                console.log('Received token usage:', data);
+                                                const actualTotal = data.total_token_count;
+                                                setTotalTokens(actualTotal);
+                                                console.log(`Updated total tokens to: ${actualTotal}`);
+                                            } else if (data.text) {
+                                                streamingContent += data.text;
+                                                // Use simple client-side formatting for streaming
+                                                aiContentDiv.innerHTML = '<p>' + formatTextSimple(streamingContent) + '<span class="typing-cursor">|</span></p>';
+                                            }
+                                            // Smart scroll - only if user hasn't scrolled up
+                                            smartScroll();
+                                        } catch (e) {
+                                            console.warn('JSON parse error for line:', line, e);
+                                            // Ignore JSON parse errors for incomplete chunks
+                                        }
+                                    }
+                                });
+                            } catch (e) {
+                                console.error('Error processing stream chunk:', e);
+                            }
+
+                            return readStream();
+                        }).catch(error => {
+                            if (error.name === 'AbortError') {
+                                console.log('Stream was aborted - this is expected for consecutive prompts');
+                            } else {
+                                console.error('Stream reading error:', error);
+                                aiContentDiv.innerHTML = `<p class="error">Stream error: ${error.message}</p>`;
+                            }
+                        });
+                    }
+
+                    return readStream();
+                })
+                .catch(error => {
+                    // Clean up on error
+                    currentReader = null;
+                    currentAbortController = null;
+                    
+                    if (error.name === 'AbortError') {
+                        console.log('Request was aborted - this is expected for consecutive prompts');
+                        // Don't show error message for aborted requests
+                    } else {
+                        console.error('Fetch error:', error);
+                        aiContentDiv.innerHTML = `<p class="error">Error: ${error.message}</p>`;
+                    }
+                    
+                    // Re-enable the form
+                    promptInput.disabled = false;
+                    const submitBtn = promptForm.querySelector('button[type="submit"]');
+                    if (submitBtn) submitBtn.disabled = false;
+                });
+            });
+
+            // Initialize
+            initDarkMode();
+            updateCacheStatus();
+            loadHistory();
+            autoResizeTextarea();
+            updateTokenDisplay();
+            
+            // Update token count from actual conversation history
+            setTimeout(() => {
+                updateTokenCountFromHistory();
+            }, 1000);
+        });
+    </script>
+</body>
+</html>
