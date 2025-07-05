@@ -424,4 +424,4 @@ if __name__ == '__main__':
 
     print(f"Set JSON file to: {app.config['JSON_FILE']}")
 
-    app.run(debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=True)

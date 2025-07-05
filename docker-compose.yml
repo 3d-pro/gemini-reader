@@ -1,16 +1,16 @@
 services:
   gemini-reader:
     build: .
-    ports:
-      - "5000:5000"
+    container_name: gemini-reader
+    hostname: gemini-reader
     environment:
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
     volumes:
-      # Mount a local directory for JSON files
       - ./data:/app/data
-      # You can also mount specific JSON files:
-      # - ./your-file.json:/app/your-file.json
-    command: ["uv", "run", "python", "main.py", "--file", "test.json"]
-    
-    # Uncomment the following if you want to override the default JSON file
-    # command: ["uv", "run", "python", "main.py", "--file", "/app/data/your-file.json"]
+    command: ["uv", "run", "python", "main.py", "--file", "/app/data/anna-kendrick.json"]
+    networks:
+      - main-network
+
+networks:
+  main-network:
+    external: true

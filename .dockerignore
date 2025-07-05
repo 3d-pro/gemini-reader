@@ -57,3 +57,6 @@ Dockerfile
 
 # UV cache
 .uv/
+
+# Folders
+data/
